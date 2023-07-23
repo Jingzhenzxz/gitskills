@@ -2,14 +2,14 @@ local core = require("apisix.core")
 local http = require("resty.http")
 local lrucache = require("resty.lrucache")
 local json = require("apisix.core.json")
+local balancer = require("apisix.balancer")
 
--- 定义一个插件
 local plugin_name = "gray_release"
 
 local _M = {
     version = 0.1,
     priority = 1000,
-    type = 'balancer',
+    type = 'rewrite',  -- 修改插件类型为 rewrite
     name = plugin_name,
     schema = {
         type = "object",
@@ -22,8 +22,9 @@ local _M = {
 }
 
 -- initialize the cache
-local c, err = lrucache.new(200)  -- allow up to 200 items in the cache
-if not c then
+local cache, err = lrucache.new(200)  -- allow up to 200 items in the cache
+core.log.warn("初始化 cache")
+if not cache then
     return error("failed to create the cache: " .. (err or "unknown"))
 end
 
@@ -65,54 +66,34 @@ local function fetch_and_cache_routes(conf)
             local key = route.systemId .. "_" .. route.grayLevel
             core.log.warn("key 为：", key)
             core.log.warn("目标地址为：", core.json.encode(route.targetUrl))
-            c:set(key, route.targetUrl)
+            cache:set(key, route.targetUrl)
         end
     end
 end
 
-function _M.init()
-    local local_conf = core.config.local_conf()
-    if local_conf.plugin_attr and local_conf.plugin_attr[plugin_name] then
-        fetch_and_cache_routes(local_conf.plugin_attr[plugin_name])
-    end
-end
+-- function _M.init()
+--     core.log.warn("进入 init 阶段")
+--     local local_conf = core.config.local_conf()
+--     core.log.warn("local_conf 为：", core.json.encode(local_conf))
+
+--     if local_conf.plugin_attr and local_conf.plugin_attr[plugin_name] then
+--         fetch_and_cache_routes(local_conf.plugin_attr[plugin_name])
+--     end
+-- end
 
 function _M.check_schema(conf)
+    core.log.warn("进入 check_schema 阶段")
     return core.schema.check(_M.schema, conf)
 end
 
--- 在balancer阶段被调用
-function _M.balancer(conf, ctx)
-    core.log.warn("进入 balancer 阶段")
-    local upstream = ctx.upstream -- 在access阶段保存的上游地址
-    core.log.warn("balancer 阶段获得的 upstream 为：", upstream)
+-- 在rewrite阶段被调用
+function _M.rewrite(conf, ctx)
+    core.log.warn("进入 rewrite 阶段")
+    core.log.warn("ctx.matched_route 为：", core.json.encode(ctx.matched_route))
 
-    if upstream then
-        -- 我们假设 upstream 的格式是 "ip:port"
-        local ip, port = upstream:match("([^:]+):?(.*)")
-        port = tonumber(port)
-
-        if ip and port then
-            -- 设置当前请求的上游
-            local addr = ctx.balancer_address
-            addr.ip = ip
-            addr.port = port
-            core.log.warn("设置的 addr 为：", addr)
-        else
-            core.log.error("无法解析 upstream 地址：", upstream)
-            return 503, "无法解析 upstream 地址"
-        end
-    else
-        core.log.error("没有获取到 access 阶段保存的上游地址")
-        return 503, "没有获取到 access 阶段保存的上游地址"
-    end
-end
-
--- 在access阶段被调用
-function _M.access(conf, ctx)
     fetch_and_cache_routes(conf)
 
-    local env = ctx.var["cookie_lambo-gray-level"]
+    local env = ctx.var["cookie_gray-level"]
     core.log.warn("env 为：", env)
     local systemId = ctx.var.cookie_systemId
     core.log.warn("systemId 为：", systemId)
@@ -122,11 +103,35 @@ function _M.access(conf, ctx)
     end
 
     local key = systemId .. "_" .. env
-    local upstream = c:get(key)
-    core.log.warn("access 阶段获得的 upstream 为：", upstream)
+    local upstream = cache:get(key)
+    core.log.warn("rewrite 阶段获得的 upstream 为：", upstream)
     if upstream then
-        -- 保存上游地址到ctx
-        ctx.upstream = upstream
+        -- 我们假设 upstream 的格式是 "ip:port"
+        local ip, port = upstream:match("([^:]+):?(.*)")
+        port = tonumber(port)
+
+        core.log.warn("ip 为：", ip)
+        core.log.warn("port 为：", port)
+        
+        if ip and port then
+            -- 创建新的上游配置
+            local new_upstream = {
+                type = 'roundrobin', --设置成默认的 roundrobin
+                nodes = {[ip .. ":" .. port] = 1}, -- 使用新的 ip 和 port
+            }
+
+            -- 创建新的 Balancer 实例
+            local checker = ctx.up_checker
+            local server_picker, err = balancer.create_server_picker(new_upstream, checker)
+            
+            if not server_picker then
+                core.log.warn("failed to create server picker: ", err)
+                return 503, "failed to create new server picker"
+            end
+        else
+            core.log.error("无法解析 upstream 地址：", upstream)
+            return 503, "无法解析 upstream 地址"
+        end
     else
         core.log.error("no route for ", key)
     end
